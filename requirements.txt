@@ -1,0 +1,7 @@
+streamlit
+deepface
+tf-keras
+opencv-python
+pillow
+scikit-learn
+numpy
