@@ -1,13 +1,13 @@
 """
-Celebrity Face Recognizer — Streamlit App
-Uses ArcFace + locally saved gallery files (no internet needed)
+Celebrity Face Recognizer — Streamlit App (TFLite Version)
+Uses ArcFace TFLite + locally saved gallery files (no internet needed)
 
 Requirements:
-    pip install streamlit deepface tf-keras opencv-python pillow scikit-learn numpy
+    pip install streamlit tensorflow opencv-python pillow scikit-learn numpy
 
-Files needed in SAME folder as this script (or update MODELS_DIR below):
-    arcface_weights.h5
-    gallery.pkl
+Files needed in SAME folder as this script:
+    arcface.tflite
+    gallery.pkl (optional for this specific script, but good to keep)
     gallery_matrix.npy
     celeb_names.json
 
@@ -15,19 +15,18 @@ Run:
     streamlit run streamlit_app.py
 """
 
-import os, sys, json, pickle, shutil, time, tempfile, io
+import os, json, time, io
 import numpy as np
 import streamlit as st
+import tensorflow as tf
 from PIL import Image
 from sklearn.metrics.pairwise import cosine_similarity
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────
 MODELS_DIR    = os.path.dirname(os.path.abspath(__file__))
-GALLERY_PKL   = os.path.join(MODELS_DIR, "gallery.pkl")
 MATRIX_NPY    = os.path.join(MODELS_DIR, "gallery_matrix.npy")
 LABELS_JSON   = os.path.join(MODELS_DIR, "celeb_names.json")
-WEIGHTS_SRC   = os.path.join(MODELS_DIR, "arcface_weights.h5")
-WEIGHTS_CACHE = os.path.join(os.path.expanduser("~"), ".deepface", "weights", "arcface_weights.h5")
+MODEL_TFLITE  = os.path.join(MODELS_DIR, "arcface.tflite")
 
 # ── PAGE ────────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -191,41 +190,80 @@ def conf_gradient(pct):
     elif pct >= 35: return "linear-gradient(90deg,#fbbf24,#f97316)"
     return "linear-gradient(90deg,#f87171,#e879f9)"
 
-def copy_weights():
-    if os.path.isfile(WEIGHTS_SRC) and not os.path.isfile(WEIGHTS_CACHE):
-        os.makedirs(os.path.dirname(WEIGHTS_CACHE), exist_ok=True)
-        shutil.copy2(WEIGHTS_SRC, WEIGHTS_CACHE)
-
 @st.cache_resource(show_spinner=False)
 def load_all():
-    copy_weights()
-    with open(GALLERY_PKL, "rb") as f:
-        gallery = pickle.load(f)
+    # Load Gallery Data safely
     matrix = np.load(MATRIX_NPY)
+    if len(matrix.shape) == 1:
+        matrix = np.expand_dims(matrix, axis=0) # ensure 2D array
+        
     with open(LABELS_JSON) as f:
-        names = json.load(f)
-    return gallery, matrix, names
+        names_raw = json.load(f)
+        # Handle if JSON was saved as dict or list
+        names = list(names_raw.values()) if isinstance(names_raw, dict) else names_raw
+        
+    # Initialize TFLite Interpreter
+    interpreter = tf.lite.Interpreter(model_path=MODEL_TFLITE)
+    interpreter.allocate_tensors()
+    
+    return matrix, names, interpreter
 
-def run_prediction(img_bytes, suffix, matrix, names, top_k=5):
-    from deepface import DeepFace
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(img_bytes)
-        tmp_path = tmp.name
+def run_prediction(img_bytes, matrix, names, interpreter, top_k=5):
+    # 1. Load image and ensure RGB
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    
+    # 2. Dynamically resize image to what the model strictly expects 
+    # Fallback to standard ArcFace dimensions
+    req_h, req_w = 112, 112
     try:
-        result = DeepFace.represent(
-            img_path=tmp_path,
-            model_name="ArcFace",
-            detector_backend="skip",
-            enforce_detection=False,
-            align=False,
-        )
-        vec = np.array(result[0]["embedding"], dtype=np.float32)
-        vec = vec / (np.linalg.norm(vec) + 1e-10)
-        sims = cosine_similarity(vec.reshape(1, -1), matrix)[0]
-        idx  = np.argsort(sims)[::-1][:top_k]
-        return [(names[i], float(sims[i])) for i in idx]
-    finally:
-        os.unlink(tmp_path)
+        input_details = interpreter.get_input_details()[0]
+        input_shape = input_details['shape']
+        if len(input_shape) >= 3:
+            req_h, req_w = input_shape[1], input_shape[2]
+    except Exception:
+        pass # use fallback
+        
+    img = img.resize((req_w, req_h))
+    
+    # 3. Format array
+    img_array = np.array(img, dtype=np.float32)
+    if len(img_array.shape) == 3:
+        img_array = np.expand_dims(img_array, axis=0)
+        
+    img_array /= 255.0 
+
+    # 4. Inference
+    try:
+        # Use signature runner to bypass get_input_details() bug in TF 2.16+
+        runner = interpreter.get_signature_runner()
+        input_name = list(runner._inputs.keys())[0] if hasattr(runner._inputs, 'keys') else list(runner._inputs)[0][0]
+        out_dict = runner(**{input_name: img_array})
+        output_name = list(out_dict.keys())[0]
+        output_data = out_dict[output_name]
+    except Exception:
+        # Fallback if signature runner is unavailable
+        input_details = interpreter.get_input_details()[0]
+        output_details = interpreter.get_output_details()[0]
+        interpreter.set_tensor(input_details['index'], img_array)
+        interpreter.invoke()
+        output_data = interpreter.get_tensor(output_details['index'])
+    
+    # 5. Extract embedding safely (flatten avoids tuple/0D indexing errors)
+    vec = output_data.flatten()
+
+    # 7. L2 Normalize
+    vec_norm = np.linalg.norm(vec)
+    if vec_norm == 0: vec_norm = 1e-10
+    vec = vec / vec_norm
+
+    # 8. Compute Cosine Similarity
+    sims = cosine_similarity(vec.reshape(1, -1), matrix)[0]
+    
+    # 9. Find Top K Matches safely
+    top_k = min(top_k, len(names))
+    idx  = np.argsort(sims)[::-1][:top_k]
+    
+    return [(names[i], float(sims[i])) for i in idx]
 
 # ── SESSION STATE ────────────────────────────────────────────────────────────
 for k, v in [("results", None), ("elapsed", None),
@@ -239,19 +277,19 @@ st.markdown("""
   <span class="logo">◈</span>
   <div>
     <div class="title">Celebrity Face Recognizer</div>
-    <div class="sub">ArcFace · Deep Metric Learning · 100% Local Inference</div>
+    <div class="sub">ArcFace TFLite · Deep Metric Learning · 100% Local Inference</div>
   </div>
 </div>
 """, unsafe_allow_html=True)
 
 # ── LOAD MODEL ───────────────────────────────────────────────────────────────
-missing = [f for f in [GALLERY_PKL, MATRIX_NPY, LABELS_JSON] if not os.path.isfile(f)]
+missing = [f for f in [MODEL_TFLITE, MATRIX_NPY, LABELS_JSON] if not os.path.isfile(f)]
 if missing:
     st.error(f"Missing model files: {', '.join(os.path.basename(m) for m in missing)}\n\nPlace them in: `{MODELS_DIR}`")
     st.stop()
 
-with st.spinner("Loading ArcFace gallery…"):
-    gallery, matrix, names = load_all()
+with st.spinner("Loading ArcFace TFLite model and gallery…"):
+    matrix, names, interpreter = load_all()
 
 # ── LAYOUT ───────────────────────────────────────────────────────────────────
 st.markdown("<div style='padding: 28px 36px 0;'>", unsafe_allow_html=True)
@@ -273,7 +311,7 @@ with col_left:
         st.session_state.img_bytes = raw
         st.session_state.img_name  = uploaded.name
         img = Image.open(io.BytesIO(raw)).convert("RGB")
-        st.image(img, use_container_width=True)
+        st.image(img, width='stretch')
         st.markdown(
             f'<div style="margin-top:8px;">'
             f'<span class="chip">📄 {uploaded.name}</span>'
@@ -297,13 +335,13 @@ with col_left:
     with c1:
         predict_clicked = st.button("⚡  Predict",
                                     disabled=(not uploaded),
-                                    use_container_width=True)
+                                    width='stretch')
     with c2:
-        reset_clicked = st.button("↺  Reset", use_container_width=True)
+        reset_clicked = st.button("↺  Reset", width='stretch')
 
     st.markdown(f"""
     <div style="margin-top:14px;">
-      <span class="chip">◈ ArcFace</span>
+      <span class="chip">◈ TFLite ArcFace</span>
       <span class="chip">👤 {len(names)} celebrities</span>
       <span class="badge-ready" style="margin-left:6px;">● Ready</span>
     </div>""", unsafe_allow_html=True)
@@ -322,12 +360,10 @@ with col_right:
         st.rerun()
 
     if predict_clicked and st.session_state.img_bytes:
-        with st.spinner("Running ArcFace inference…"):
+        with st.spinner("Running fast TFLite inference…"):
             try:
                 t0 = time.time()
-                suffix = os.path.splitext(st.session_state.img_name)[-1] or ".jpg"
-                preds = run_prediction(st.session_state.img_bytes,
-                                       suffix, matrix, names)
+                preds = run_prediction(st.session_state.img_bytes, matrix, names, interpreter)
                 st.session_state.results = preds
                 st.session_state.elapsed = time.time() - t0
             except Exception as ex:
@@ -354,7 +390,7 @@ with col_right:
 
         # Top 5
         medals = ["①","②","③","④","⑤"]
-        st.markdown('<div class="section-label" style="margin-top:4px;">Top 5 Candidates</div>',
+        st.markdown('<div class="section-label" style="margin-top:4px;">Top Candidates</div>',
                     unsafe_allow_html=True)
 
         rows = ""
@@ -398,5 +434,5 @@ st.markdown("</div>", unsafe_allow_html=True)
 
 st.markdown("""
 <div class="app-footer">
-  Celebrity Recognizer · ArcFace Deep Metric Learning · Local Inference · No Internet Required
+  Celebrity Recognizer · TFLite ArcFace Engine · Zero-Dependency Local Inference
 </div>""", unsafe_allow_html=True)
